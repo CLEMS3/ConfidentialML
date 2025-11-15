@@ -1,0 +1,42 @@
+# Docker Compose file version
+version: "3.8"
+
+# Define all the containers (services) we want to run
+services:
+  
+  # The Server
+  server:
+    # Build the image from the Dockerfile in this folder ('.')
+    build: .
+    # Name the resulting image 'confidentialml-app'
+    image: confidentialml-app
+    # Run the server script
+    command: ["python", "server.py"]
+    # Connect this container to our custom network
+    networks:
+      - fl_network
+
+  # The Clients
+  client:
+    # RE-USE the same image we just built
+    image: confidentialml-app
+    # Run the client script
+    command: ["python", "clients.py"]
+    # Pass in the environment variable to find the server
+    environment:
+      # The client will connect to "http://server:8080"
+      # Docker Compose makes the "server" service reachable 
+      # at the hostname "server".
+      - SERVER_ADDRESS=http://server:8080
+    # Connect this container to the same network
+    networks:
+      - fl_network
+    # Tell Compose to start the 'server' container before 
+    # starting any 'client' containers
+    depends_on:
+      - server
+
+# Define the shared network
+networks:
+  fl_network:
+    driver: bridge
