@@ -1,42 +1,71 @@
 import os
 import time
+import random
 import requests
+import socket # To get a unique ID for the container
 
-# 1. Get the server address from the environment variable
-#    This is set in your '3-client-deployment.yaml'
-server_addr = os.environ.get("SERVER_ADDRESS")
+# Configuration
+SERVER_ADDR = os.environ.get("SERVER_ADDRESS", "http://server:8080")
+CLIENT_ID = socket.gethostname() # Use the container ID as the client ID
 
-if not server_addr:
-    print("Error: SERVER_ADDRESS environment variable not set.")
-    # Exit if the server address is not provided
-    exit(1)
+print(f"Client {CLIENT_ID} starting...")
 
-# Construct the full URL for the server's endpoint
-server_hello_url = f"{server_addr}/hello"
+# State to track which round we have already processed
+last_processed_round = -1
 
-print(f"Client started. Will contact server at: {server_hello_url}")
+def train_local_model(global_weights):
+    """
+    Simulate training. 
+    In reality, you would run TensorFlow/PyTorch here.
+    For now, we just add a random number to the weights.
+    """
+    print(f"Training on data... (Simulated)")
+    time.sleep(1) # Pretend to work
+    
+    # Create new weights by adding random noise to global weights
+    # This simulates "learning" something unique to this client
+    modification = random.uniform(0.1, 0.5)
+    local_weights = [w + modification for w in global_weights]
+    
+    return local_weights
 
-# Run in an infinite loop to periodically 'check in' with the server
 while True:
     try:
-        # 2. Make a request to the server
-        response = requests.get(server_hello_url, timeout=5)
-        response.raise_for_status()  # Raise an exception for bad status codes
-
-        # 3. Process the server's response
+        # 1. Poll Server for the Global Model
+        response = requests.get(f"{SERVER_ADDR}/get_model", timeout=5)
         data = response.json()
-        print(f"Successfully connected to server. Response: {data}")
         
-        # In a real FL system, you would:
-        # 1. Receive the model from 'data'
-        # 2. Train the model on local data
-        # 3. Send the updated weights back to the server (e.g., via a POST request)
+        server_round = data["round"]
+        global_weights = data["weights"]
+
+        # 2. Check if there is a new round available
+        if server_round > last_processed_round:
+            print(f"\n--- Starting Round {server_round} ---")
+            print(f"Current Global Weights: {global_weights}")
+
+            # 3. Train (Simulated)
+            updated_weights = train_local_model(global_weights)
+            print(f"Local Training Complete. New Weights: {updated_weights}")
+
+            # 4. Send Update Back to Server
+            payload = {
+                "client_id": CLIENT_ID,
+                "weights": updated_weights
+            }
+            requests.post(f"{SERVER_ADDR}/send_update", json=payload)
+            print("Update sent to server.")
+
+            # Mark this round as done locally
+            last_processed_round = server_round
+        
+        else:
+            # If the round hasn't changed yet, we wait
+            print(f"Waiting for next round (Current: {server_round})...")
 
     except requests.exceptions.ConnectionError:
-        print("Server is not reachable. Retrying...")
-    except requests.exceptions.RequestException as e:
-        print(f"An error occurred: {e}")
-    
-    # Wait for 5 seconds before contacting the server again
-    print("Waiting 5 seconds before next check-in...\n")
-    time.sleep(5)
+        print("Server unreachable. Retrying...")
+    except Exception as e:
+        print(f"Error: {e}")
+
+    # Sleep to prevent spamming the server
+    time.sleep(3)
