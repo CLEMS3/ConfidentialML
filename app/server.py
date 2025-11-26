@@ -57,7 +57,7 @@ def register_client():
 def initiate_key_generation():
     global registered_clients, leader_id
     # Select Leader
-    leader_id = list(registered_clients)[0]
+    leader_id = random.choice(list(registered_clients))
     peers = [c for c in registered_clients if c != leader_id]
     
     print(f"Selected Leader: {leader_id}. Peers: {peers}")
