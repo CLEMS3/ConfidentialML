@@ -150,6 +150,7 @@ def receive_update():
         for layer_updates in zip(*weights_only):
             weighted_sum = 0
             for client_w, client_n in zip(layer_updates, samples_only):
+                # This seems stupid, but it is not, it is to avoid a costly addition on HE to just add a 0
                 if weighted_sum == 0:
                     weighted_sum = client_w * client_n
                 else:
