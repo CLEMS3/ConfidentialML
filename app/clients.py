@@ -10,7 +10,6 @@ import phe.paillier
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
-from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 from sklearn.datasets import make_classification
 
@@ -151,6 +150,9 @@ def load_data():
                 n_classes=2, 
                 random_state=42
             )
+            # Scale the features
+            X = StandardScaler().fit_transform(X)
+            
             # Add bias term
             X = np.c_[np.ones((X.shape[0], 1)), X]
             
@@ -337,7 +339,7 @@ while True:
                     else:
                         plaintext_weights = plaintext_weights[:NUM_FEATURES]
 
-                local_weights = train_model(plaintext_weights, X_train, y_train, epochs=5, learning_rate=1.0)
+                local_weights = train_model(plaintext_weights, X_train, y_train, epochs=10, learning_rate=1.0)
                 
                 print(f"Trained Local Model (First 5): {local_weights[:5]}")
 

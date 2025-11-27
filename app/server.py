@@ -24,7 +24,7 @@ registered_clients = set()
 selected_clients = []
 MIN_CLIENTS_TO_START = 3
 MIN_UPDATES_TO_AGGREGATE = 3
-MAX_ROUNDS = 5
+MAX_ROUNDS = 20
 NUM_FEATURES = 30 + 1 # 30 features + bias
 
 # Buffer
@@ -179,7 +179,7 @@ registered_clients = set()
 selected_clients = []
 MIN_CLIENTS_TO_START = 3
 MIN_UPDATES_TO_AGGREGATE = 3
-MAX_ROUNDS = 5
+MAX_ROUNDS = 20
 NUM_FEATURES = 30 + 1 # 30 features + bias
 
 # Buffer
