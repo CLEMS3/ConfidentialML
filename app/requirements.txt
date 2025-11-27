@@ -1,3 +1,6 @@
 Flask
 requests
 phe
+pandas
+numpy
+scikit-learn

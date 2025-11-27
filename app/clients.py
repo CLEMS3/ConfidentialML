@@ -7,6 +7,9 @@ import threading
 import json
 from flask import Flask, request, jsonify
 import phe.paillier
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import StandardScaler
 
 # --- Configuration ---
 SERVER_ADDR = os.environ.get("SERVER_ADDRESS", "http://server:8080")
@@ -17,6 +20,11 @@ CLIENT_PORT = 5000
 public_key = None
 private_key = None
 keys_received_event = threading.Event()
+
+# --- ML State ---
+X_train = None
+y_train = None
+NUM_FEATURES = 30 # V1-V28 + Amount + Bias (Time is dropped)
 
 # --- Background P2P Server ---
 app = Flask(__name__)
@@ -45,7 +53,7 @@ def trigger_keygen():
         try:
             print(f"Sending keys to peer: {peer}")
             # Assuming peer ID is hostname
-            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=5)
+            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=30)
         except Exception as e:
             print(f"Failed to send keys to {peer}: {e}")
             
@@ -80,7 +88,7 @@ def share_keys():
     for peer in peers:
         try:
             print(f"Sending keys to peer: {peer}")
-            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=5)
+            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=30)
         except Exception as e:
             print(f"Failed to send keys to {peer}: {e}")
             
@@ -106,12 +114,68 @@ def receive_keys():
 def run_background_server():
     app.run(host="0.0.0.0", port=CLIENT_PORT, debug=False, use_reloader=False)
 
+# --- Load and Preprocess Data ---
+def load_data():
+    global X_train, y_train, NUM_FEATURES
+    print("Loading dataset...")
+    try:
+        df = pd.read_csv("creditcard.csv")
+        
+        # Preprocessing
+        # 1. Drop Time (not useful for general fraud detection usually)
+        df = df.drop(['Time'], axis=1)
+        
+        # 2. Scale Amount
+        df['Amount'] = StandardScaler().fit_transform(df['Amount'].values.reshape(-1, 1))
+        
+        # 3. Split Features and Target
+        X = df.drop(['Class'], axis=1).values
+        y = df['Class'].values
+        
+        # 4. Add Bias Term (column of 1s)
+        X = np.c_[np.ones((X.shape[0], 1)), X]
+        
+        # 5. Split for this client (Simulate FL by taking a random chunk)
+        # We will take a random 5000 sample of the dataset for this client.
+        indices = np.random.choice(len(X), 5000, replace=False)
+        X_train = X[indices]
+        y_train = y[indices]
+        
+        NUM_FEATURES = X_train.shape[1]
+        print(f"Data loaded. Shape: {X_train.shape}. Features: {NUM_FEATURES}")
+        
+    except Exception as e:
+        print(f"Failed to load dataset: {e}")
+        # Fallback to dummy data
+        X_train = np.random.randn(100, 31)
+        y_train = np.random.randint(0, 2, 100)
+        NUM_FEATURES = 31
+
+# --- ML Functions ---
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def train_model(weights, X, y, epochs=1, learning_rate=0.1):
+    m = len(y)
+    weights = np.array(weights)
+    
+    for _ in range(epochs):
+        z = np.dot(X, weights)
+        h = sigmoid(z)
+        gradient = np.dot(X.T, (h - y)) / m
+        weights -= learning_rate * gradient
+        
+    return weights.tolist()
+
 # --- Main Client Logic ---
 print(f"Client {CLIENT_ID} starting...")
 
 # Start Background Server
 server_thread = threading.Thread(target=run_background_server, daemon=True)
 server_thread.start()
+
+# Load Data
+load_data()
 
 # 1. Register
 while True:
@@ -130,8 +194,12 @@ last_processed_round = 0
 while True:
     try:
         # Poll Server
-        response = requests.get(f"{SERVER_ADDR}/get_model", timeout=5)
+        response = requests.get(f"{SERVER_ADDR}/get_model", timeout=30)
         data = response.json()
+        
+        if data.get("complete"):
+            print("\n=== TRAINING COMPLETE. EXITING. ===")
+            break
         
         server_round = data["round"]
         selected_clients = data["selected_clients"]
@@ -168,17 +236,24 @@ while True:
                         plaintext_weights.append(decrypted_sum / total_samples)
                 else:
                     # Fallback if empty (shouldn't happen if server inits correctly)
-                    plaintext_weights = [0.0, 0.0, 0.0]
+                    plaintext_weights = [0.0] * NUM_FEATURES
                 
-                print(f"Decrypted Global Model: {plaintext_weights}")
+                print(f"Decrypted Global Model (First 5): {plaintext_weights[:5]}")
 
-                # 2. Simulate Training
-                time.sleep(random.uniform(0.5, 2.0))
-                num_samples = random.randint(10, 100)
-                # Simple training simulation: add random noise
-                local_weights = [w + random.uniform(0.1, 0.5) for w in plaintext_weights]
+                # 2. Real Training
+                print("Training on local data...")
                 
-                print(f"Trained Local Model: {local_weights}")
+                # Ensure weights length matches features
+                if len(plaintext_weights) != NUM_FEATURES:
+                    print(f"WARNING: Weight shape mismatch. Server: {len(plaintext_weights)}, Local: {NUM_FEATURES}")
+                    if len(plaintext_weights) < NUM_FEATURES:
+                        plaintext_weights.extend([0.0] * (NUM_FEATURES - len(plaintext_weights)))
+                    else:
+                        plaintext_weights = plaintext_weights[:NUM_FEATURES]
+
+                local_weights = train_model(plaintext_weights, X_train, y_train, epochs=5, learning_rate=1.0)
+                
+                print(f"Trained Local Model (First 5): {local_weights[:5]}")
 
                 # 3. Encrypt Local Update
                 encrypted_local_weights = []
@@ -190,10 +265,10 @@ while True:
                 payload = {
                     "client_id": CLIENT_ID,
                     "weights": encrypted_local_weights,
-                    "num_samples": num_samples
+                    "num_samples": len(X_train)
                 }
                 requests.post(f"{SERVER_ADDR}/send_update", json=payload)
-                print(f"Update sent. Samples: {num_samples}")
+                print(f"Update sent. Samples: {len(X_train)}")
                 
                 last_processed_round = server_round
             else:

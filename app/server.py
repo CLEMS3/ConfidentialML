@@ -10,7 +10,9 @@ port = int(os.environ.get("PORT", 8080))
 
 # --- Global State ---
 global_model = [] # Will hold encrypted weights (SUM)
+serialized_global_model_cache = None # Cache for serialized model
 global_round = 0 
+training_complete = False
 public_key = None
 global_total_samples = 1 # Denominator for the global model
 key_gen_triggered = False # Flag to ensure we only trigger keygen once
@@ -21,13 +23,15 @@ registered_clients = set()
 selected_clients = []
 MIN_CLIENTS_TO_START = 3
 MIN_UPDATES_TO_AGGREGATE = 3
+MAX_ROUNDS = 5
+NUM_FEATURES = 30 + 1 # 30 features + bias
 
 # Buffer
 client_updates = []
 
 @app.route("/")
 def index():
-    return jsonify({"status": "server_ready", "round": global_round})
+    return jsonify({"status": "server_ready", "round": global_round, "complete": training_complete})
 
 @app.route("/register", methods=["POST"])
 def register_client():
@@ -71,25 +75,33 @@ def initiate_key_generation():
 
 @app.route("/public_key", methods=["POST"])
 def receive_public_key():
-    global public_key, global_model, global_total_samples
+    global public_key, global_model, global_total_samples, serialized_global_model_cache
     data = request.json
     n = int(data["n"])
     public_key = phe.paillier.PaillierPublicKey(n)
     print("Received Public Key from Leader.")
     
-    # Init with 3 weights as per original code
+    # Init with correct number of weights
     # We init with Encrypted(0). The denominator will be 1.
-    global_model = [public_key.encrypt(0.0) for _ in range(3)]
+    global_model = [public_key.encrypt(0.0) for _ in range(NUM_FEATURES)]
+    serialized_global_model_cache = None # Invalidate cache
     global_total_samples = 1
     
     start_new_round()
     return jsonify({"status": "received"})
 
 def start_new_round():
-    global global_round, selected_clients, client_updates
+    global global_round, selected_clients, client_updates, training_complete
     
     # 1. Increment Round
     global_round += 1
+    
+    if global_round > MAX_ROUNDS:
+        print(f"=== TRAINING COMPLETE (Reached {MAX_ROUNDS} rounds) ===")
+        print("Final model is ready.")
+        training_complete = True
+        selected_clients = [] # Clear selected clients so no one trains
+        return
     
     # 2. Select Clients
     available = list(registered_clients)
@@ -105,23 +117,31 @@ def start_new_round():
 
 @app.route("/get_model", methods=["GET"])
 def get_model():
-    # Serialize encrypted model for sending
-    serialized_model = []
-    if public_key and global_model:
-        for val in global_model:
-            serialized_model.append((str(val.ciphertext()), val.exponent))
+    global serialized_global_model_cache
+    
+    # Use cached serialization if available
+    if serialized_global_model_cache is None:
+        # Serialize encrypted model for sending
+        serialized_model = []
+        if public_key and global_model:
+            for val in global_model:
+                serialized_model.append((str(val.ciphertext()), val.exponent))
+        serialized_global_model_cache = serialized_model
+    else:
+        serialized_model = serialized_global_model_cache
             
     return jsonify({
         "round": global_round,
         "weights": serialized_model,
         "total_samples": global_total_samples,
         "selected_clients": selected_clients,
-        "public_key": {"n": str(public_key.n)} if public_key else None
+        "public_key": {"n": str(public_key.n)} if public_key else None,
+        "complete": training_complete
     })
 
 @app.route("/send_update", methods=["POST"])
 def receive_update():
-    global global_model, global_round, client_updates, global_total_samples
+    global global_model, global_round, client_updates, global_total_samples, serialized_global_model_cache
 
     data = request.json
     client_id = data.get("client_id")
@@ -161,6 +181,7 @@ def receive_update():
             new_weights.append(weighted_sum)
 
         global_model = new_weights
+        serialized_global_model_cache = None # Invalidate cache
         global_total_samples = total_samples
         print(f"Round {global_round} complete. Aggregated Encrypted Model (Sum). Total Samples: {total_samples}")
         
