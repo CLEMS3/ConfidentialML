@@ -7,6 +7,9 @@ import threading
 import json
 from flask import Flask, request, jsonify
 import phe.paillier
+import math
+import numpy as np
+
 
 # --- Configuration ---
 SERVER_ADDR = os.environ.get("SERVER_ADDRESS", "http://server:8080")
@@ -17,6 +20,19 @@ CLIENT_PORT = 5000
 public_key = None
 private_key = None
 keys_received_event = threading.Event()
+
+# DP / Clipping config (can be set via environment variables)
+DP_ENABLED = os.environ.get("DP_ENABLED", "1") not in ("0", "false", "False")
+CLIP_NORM = float(os.environ.get("CLIP_NORM", "1.0"))           # C (L2 clip)
+NOISE_MULTIPLIER = float(os.environ.get("NOISE_MULTIPLIER", "1.0"))
+
+# Proper DP parameters: per-round (epsilon, delta)
+DP_EPS = float(os.environ.get("DP_EPS", "1.0"))                 # per-round epsilon
+DP_DELTA = float(os.environ.get("DP_DELTA", "1e-5"))            # per-round delta
+
+# RNG for vectorized noise sampling
+_rng = np.random.default_rng()
+
 
 # --- Background P2P Server ---
 app = Flask(__name__)
@@ -113,6 +129,39 @@ print(f"Client {CLIENT_ID} starting...")
 server_thread = threading.Thread(target=run_background_server, daemon=True)
 server_thread.start()
 
+# ---------------- DP helpers ----------------
+def gaussian_sigma_for_eps_delta(C: float, eps: float, delta: float) -> float:
+    """
+    Standard sufficient sigma for (eps, delta)-DP with Gaussian mechanism for L2 sensitivity C.
+    sigma = C * sqrt(2 ln(1.25/delta)) / eps
+    """
+    if eps <= 0 or delta <= 0 or delta >= 1:
+        raise ValueError("eps>0 and 0<delta<1 required")
+    return C * math.sqrt(2 * math.log(1.25 / delta)) / eps
+
+def l2_clip_vector(vec: np.ndarray, C: float):
+    norm = np.linalg.norm(vec)
+    if norm == 0.0 or norm <= C:
+        return vec.copy(), norm, 1.0
+    factor = C / (norm + 1e-12)
+    return vec * factor, norm, factor
+
+def add_gaussian_noise_vec(vec: np.ndarray, sigma: float, rng: np.random.Generator):
+    noise = rng.normal(loc=0.0, scale=sigma, size=vec.shape)
+    return vec + noise
+# ---------------- end DP helpers ----------------
+
+# precompute sigma (per-round) if DP parameters provided
+per_round_sigma = None
+if DP_ENABLED:
+    try:
+        per_round_sigma = gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
+        print(f"Per-round noise sigma computed: {per_round_sigma:.6f}")
+    except Exception as e:
+        print("Error computing sigma:", e)
+        per_round_sigma = None
+
+
 # 1. Register
 while True:
     try:
@@ -177,15 +226,39 @@ while True:
                 num_samples = random.randint(10, 100)
                 # Simple training simulation: add random noise
                 local_weights = [w + random.uniform(0.1, 0.5) for w in plaintext_weights]
-                
+
                 print(f"Trained Local Model: {local_weights}")
 
-                # 3. Encrypt Local Update
+                # Differential Privacy: compute update = local - global, clip, add Gaussian noise
+                # convert lists to numpy arrays for vectorized ops
+                plaintext_weights_np = np.array(plaintext_weights, dtype=np.float64)
+                local_weights_np = np.array(local_weights, dtype=np.float64)
+
+                # compute update as numpy array
+                update = local_weights_np - plaintext_weights_np
+
+                if DP_ENABLED:
+                    # clip update (returns numpy array)
+                    clipped_update, orig_norm, factor = l2_clip_vector(update, CLIP_NORM)
+                    # choose sigma (use precalc if available)
+                    sigma = per_round_sigma if per_round_sigma is not None else gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
+                    # add Gaussian noise (vectorized)
+                    noised_update = add_gaussian_noise_vec(clipped_update, sigma, _rng)
+                    # reconstruct noised local model (numpy -> list)
+                    noised_local_np = plaintext_weights_np + noised_update
+                    noised_local = noised_local_np.tolist()
+                    print(f"DP: orig_norm={orig_norm:.4f}, clipped_factor={factor:.6f}, per-round_sigma={sigma:.6f}")
+                else:
+                    noised_local = local_weights
+
+
+
+                # 3. Encrypt Local (noised) Update / Model
                 encrypted_local_weights = []
-                for w in local_weights:
+                for w in noised_local:
                     enc_w = public_key.encrypt(w)
                     encrypted_local_weights.append((str(enc_w.ciphertext()), enc_w.exponent))
-                
+
                 # 4. Send Update
                 payload = {
                     "client_id": CLIENT_ID,
