@@ -7,6 +7,7 @@ import threading
 import json
 from flask import Flask, request, jsonify
 import phe.paillier
+import math
 import pandas as pd
 import numpy as np
 from sklearn.preprocessing import StandardScaler
@@ -22,6 +23,24 @@ CLIENT_PORT = 5000
 public_key = None
 private_key = None
 keys_received_event = threading.Event()
+
+# DP / Clipping config (can be set via environment variables)
+DP_ENABLED = os.environ.get("DP_ENABLED", "1") not in ("0", "false", "False")
+CLIP_NORM = float(os.environ.get("CLIP_NORM", "1.0"))           # C (L2 clip)
+NOISE_MULTIPLIER = float(os.environ.get("NOISE_MULTIPLIER", "1.0"))
+
+# Proper DP parameters: per-round (epsilon, delta)
+DP_EPS = float(os.environ.get("DP_EPS", "5.0"))                 # per-round epsilon
+DP_DELTA = float(os.environ.get("DP_DELTA", "1e-5"))            # per-round delta
+
+# RNG for vectorized noise sampling
+_rng = np.random.default_rng()
+
+# target total budget (optional): stop when composed epsilon > TARGET_EPS
+TARGET_TOTAL_EPS = float(os.environ.get("TARGET_TOTAL_EPS", "10.0"))  # pick your allowed total epsilon
+REPORT_DELTA = float(os.environ.get("REPORT_DELTA", DP_DELTA))        # delta used for final eps reporting
+RDP_ORDERS = [1.25,1.5,2,2.5,3,5,10,20,50,100]                       # RDP orders to search
+rounds_done = 0
 
 # --- ML State ---
 X_train = None
@@ -211,6 +230,65 @@ print(f"Client {CLIENT_ID} starting...")
 server_thread = threading.Thread(target=run_background_server, daemon=True)
 server_thread.start()
 
+# ---------------- DP helpers ----------------
+def gaussian_sigma_for_eps_delta(C: float, eps: float, delta: float) -> float:
+    """
+    Standard sufficient sigma for (eps, delta)-DP with Gaussian mechanism for L2 sensitivity C.
+    sigma = C * sqrt(2 ln(1.25/delta)) / eps
+    """
+    if eps <= 0 or delta <= 0 or delta >= 1:
+        raise ValueError("eps>0 and 0<delta<1 required")
+    return C * math.sqrt(2 * math.log(1.25 / delta)) / eps
+
+def l2_clip_vector(vec: np.ndarray, C: float):
+    norm = np.linalg.norm(vec)
+    if norm == 0.0 or norm <= C:
+        return vec.copy(), norm, 1.0
+    factor = C / (norm + 1e-12)
+    return vec * factor, norm, factor
+
+def add_gaussian_noise_vec(vec: np.ndarray, sigma: float, rng: np.random.Generator):
+    noise = rng.normal(loc=0.0, scale=sigma, size=vec.shape)
+    return vec + noise
+# ---------------- end DP helpers ----------------
+
+# ---------------- RDP helpers ----------------
+def compute_rdp_gaussian(sigma: float, C: float, orders):
+    # Mironov formula for Gaussian mechanism RDP (per-round)
+    if sigma <= 0:
+        return [float('inf')] * len(orders)
+    return [(alpha * (C ** 2)) / (2.0 * (sigma ** 2)) for alpha in orders]
+
+def get_eps_from_rdp(orders, rdp, delta):
+    # convert RDP -> (eps, delta). returns best epsilon over orders
+    if delta <= 0:
+        raise ValueError("delta must be > 0")
+    log1_delta = math.log(1.0 / delta)
+    eps_candidates = []
+    for alpha, eps_alpha in zip(orders, rdp):
+        if alpha <= 1: 
+            continue
+        eps = eps_alpha + log1_delta / (alpha - 1.0)
+        eps_candidates.append(eps)
+    return min(eps_candidates) if eps_candidates else float('inf')
+
+def compose_rdp_and_get_eps(sigma: float, C: float, orders, delta, rounds):
+    per_round_rdp = compute_rdp_gaussian(sigma, C, orders)
+    total_rdp = [r * rounds for r in per_round_rdp]
+    return get_eps_from_rdp(orders, total_rdp, delta)
+
+# ---------------- end RDP helpers ----------------
+
+# precompute sigma (per-round) if DP parameters provided
+per_round_sigma = None
+if DP_ENABLED:
+    try:
+        per_round_sigma = gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
+        print(f"Per-round noise sigma computed: {per_round_sigma:.6f}")
+    except Exception as e:
+        print("Error computing sigma:", e)
+        per_round_sigma = None
+
 # Load Data
 load_data()
 
@@ -339,16 +417,41 @@ while True:
                     else:
                         plaintext_weights = plaintext_weights[:NUM_FEATURES]
 
+
                 local_weights = train_model(plaintext_weights, X_train, y_train, epochs=10, learning_rate=1.0)
                 
                 print(f"Trained Local Model (First 5): {local_weights[:5]}")
 
-                # 3. Encrypt Local Update
+                # Differential Privacy: compute update = local - global, clip, add Gaussian noise
+                # convert lists to numpy arrays for vectorized ops
+                plaintext_weights_np = np.array(plaintext_weights, dtype=np.float64)
+                local_weights_np = np.array(local_weights, dtype=np.float64)
+
+                # compute update as numpy array
+                update = local_weights_np - plaintext_weights_np
+
+                if DP_ENABLED:
+                    # clip update (returns numpy array)
+                    clipped_update, orig_norm, factor = l2_clip_vector(update, CLIP_NORM)
+                    # choose sigma (use precalc if available)
+                    sigma = per_round_sigma if per_round_sigma is not None else gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
+                    # add Gaussian noise (vectorized)
+                    noised_update = add_gaussian_noise_vec(clipped_update, sigma, _rng)
+                    # reconstruct noised local model (numpy -> list)
+                    noised_local_np = plaintext_weights_np + noised_update
+                    noised_local = noised_local_np.tolist()
+                    print(f"DP: orig_norm={orig_norm:.4f}, clipped_factor={factor:.6f}, per-round_sigma={sigma:.6f}")
+                else:
+                    noised_local = local_weights
+
+
+
+                # 3. Encrypt Local (noised) Update / Model
                 encrypted_local_weights = []
-                for w in local_weights:
+                for w in noised_local:
                     enc_w = public_key.encrypt(w)
                     encrypted_local_weights.append((str(enc_w.ciphertext()), enc_w.exponent))
-                
+
                 # 4. Send Update
                 payload = {
                     "client_id": CLIENT_ID,
@@ -358,6 +461,23 @@ while True:
                 requests.post(f"{SERVER_ADDR}/send_update", json=payload, timeout=300)
                 print(f"Update sent. Samples: {len(X_train)}")
                 
+                # --- after sending the encrypted update ---
+                rounds_done += 1
+
+                # compute composed epsilon so far and report it
+                try:
+                    composed_eps = compose_rdp_and_get_eps(per_round_sigma, CLIP_NORM, RDP_ORDERS, REPORT_DELTA, rounds_done)
+                    print(f"Rounds so far: {rounds_done}. Composed epsilon (delta={REPORT_DELTA}): eps ≈ {composed_eps:.4f}")
+                except Exception as e:
+                    print("RDP accounting error:", e)
+
+                # optional: auto-stop when budget exceeded
+                if composed_eps > TARGET_TOTAL_EPS:
+                    print(f"Privacy budget exceeded: composed_eps {composed_eps:.4f} > TARGET_TOTAL_EPS {TARGET_TOTAL_EPS}")
+                    import sys
+                    # sys.exit(0)
+
+
                 last_processed_round = server_round
             else:
                 print(f"\n[ROUND {server_round}] I was NOT selected. Skipping.")
