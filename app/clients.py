@@ -33,6 +33,12 @@ DP_DELTA = float(os.environ.get("DP_DELTA", "1e-5"))            # per-round delt
 # RNG for vectorized noise sampling
 _rng = np.random.default_rng()
 
+# target total budget (optional): stop when composed epsilon > TARGET_EPS
+TARGET_TOTAL_EPS = float(os.environ.get("TARGET_TOTAL_EPS", "10.0"))  # pick your allowed total epsilon
+REPORT_DELTA = float(os.environ.get("REPORT_DELTA", DP_DELTA))        # delta used for final eps reporting
+RDP_ORDERS = [1.25,1.5,2,2.5,3,5,10,20,50,100]                       # RDP orders to search
+rounds_done = 0
+
 
 # --- Background P2P Server ---
 app = Flask(__name__)
@@ -151,6 +157,33 @@ def add_gaussian_noise_vec(vec: np.ndarray, sigma: float, rng: np.random.Generat
     return vec + noise
 # ---------------- end DP helpers ----------------
 
+# ---------------- RDP helpers ----------------
+def compute_rdp_gaussian(sigma: float, C: float, orders):
+    # Mironov formula for Gaussian mechanism RDP (per-round)
+    if sigma <= 0:
+        return [float('inf')] * len(orders)
+    return [(alpha * (C ** 2)) / (2.0 * (sigma ** 2)) for alpha in orders]
+
+def get_eps_from_rdp(orders, rdp, delta):
+    # convert RDP -> (eps, delta). returns best epsilon over orders
+    if delta <= 0:
+        raise ValueError("delta must be > 0")
+    log1_delta = math.log(1.0 / delta)
+    eps_candidates = []
+    for alpha, eps_alpha in zip(orders, rdp):
+        if alpha <= 1: 
+            continue
+        eps = eps_alpha + log1_delta / (alpha - 1.0)
+        eps_candidates.append(eps)
+    return min(eps_candidates) if eps_candidates else float('inf')
+
+def compose_rdp_and_get_eps(sigma: float, C: float, orders, delta, rounds):
+    per_round_rdp = compute_rdp_gaussian(sigma, C, orders)
+    total_rdp = [r * rounds for r in per_round_rdp]
+    return get_eps_from_rdp(orders, total_rdp, delta)
+
+# ---------------- end RDP helpers ----------------
+
 # precompute sigma (per-round) if DP parameters provided
 per_round_sigma = None
 if DP_ENABLED:
@@ -268,6 +301,23 @@ while True:
                 requests.post(f"{SERVER_ADDR}/send_update", json=payload)
                 print(f"Update sent. Samples: {num_samples}")
                 
+                # --- after sending the encrypted update ---
+                rounds_done += 1
+
+                # compute composed epsilon so far and report it
+                try:
+                    composed_eps = compose_rdp_and_get_eps(per_round_sigma, CLIP_NORM, RDP_ORDERS, REPORT_DELTA, rounds_done)
+                    print(f"Rounds so far: {rounds_done}. Composed epsilon (delta={REPORT_DELTA}): eps ≈ {composed_eps:.4f}")
+                except Exception as e:
+                    print("RDP accounting error:", e)
+
+                # optional: auto-stop when budget exceeded
+                if composed_eps > TARGET_TOTAL_EPS:
+                    print(f"Privacy budget exceeded: composed_eps {composed_eps:.4f} > TARGET_TOTAL_EPS {TARGET_TOTAL_EPS}")
+                    import sys
+                    # sys.exit(0)
+
+
                 last_processed_round = server_round
             else:
                 print(f"\n[ROUND {server_round}] I was NOT selected. Skipping.")
