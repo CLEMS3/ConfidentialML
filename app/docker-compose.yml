@@ -9,7 +9,7 @@ services:
     # Force Python to print logs immediately
     environment:
       - PYTHONUNBUFFERED=1
-      - MAX_ROUNDS=20
+      - MAX_ROUNDS=${MAX_ROUNDS:-20}
     networks:
       - fl_network
 
