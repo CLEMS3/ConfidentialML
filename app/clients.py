@@ -27,7 +27,7 @@ CLIP_NORM = float(os.environ.get("CLIP_NORM", "1.0"))           # C (L2 clip)
 NOISE_MULTIPLIER = float(os.environ.get("NOISE_MULTIPLIER", "1.0"))
 
 # Proper DP parameters: per-round (epsilon, delta)
-DP_EPS = float(os.environ.get("DP_EPS", "1.0"))                 # per-round epsilon
+DP_EPS = float(os.environ.get("DP_EPS", "5.0"))                 # per-round epsilon
 DP_DELTA = float(os.environ.get("DP_DELTA", "1e-5"))            # per-round delta
 
 # RNG for vectorized noise sampling
