@@ -9,6 +9,7 @@ services:
     # Force Python to print logs immediately
     environment:
       - PYTHONUNBUFFERED=1
+      - MAX_ROUNDS=20
     networks:
       - fl_network
 
@@ -19,6 +20,11 @@ services:
       - SERVER_ADDRESS=http://server:8080
       - DATASET_NAME=synthetic # Options: creditcard, synthetic
       - PYTHONUNBUFFERED=1
+      - DP_EPS=10.0
+      - DP_DELTA=1e-5
+      - TARGET_TOTAL_EPS=20.0
+      - CLIP_NORM=1.0
+      - NOISE_MULTIPLIER=2.0
     networks:
       - fl_network
     depends_on:
