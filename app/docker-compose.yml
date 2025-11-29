@@ -1,26 +1,24 @@
 version: "3.8"
 
 services:
-  
+
   server:
     build: .
     image: confidentialml-app
-    command: ["python", "server.py"]
+    command: [ "python", "server.py" ]
     # Force Python to print logs immediately
     environment:
-      - PYTHONUNBUFFERED=1 
+      - PYTHONUNBUFFERED=1
     networks:
       - fl_network
 
   client:
     image: confidentialml-app
-    # CHECK THIS: Is your file named 'client.py' or 'clients.py'? 
-    # I set it to 'client.py' to match your previous code.
-    command: ["python", "clients.py"] 
+    command: [ "python", "clients.py" ]
     environment:
       - SERVER_ADDRESS=http://server:8080
-      # This is the magic line that fixes your empty logs:
-      - PYTHONUNBUFFERED=1 
+      - DATASET_NAME=synthetic # Options: creditcard, synthetic
+      - PYTHONUNBUFFERED=1
     networks:
       - fl_network
     depends_on:

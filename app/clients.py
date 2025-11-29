@@ -8,8 +8,11 @@ import json
 from flask import Flask, request, jsonify
 import phe.paillier
 import math
+import pandas as pd
 import numpy as np
-
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
+from sklearn.datasets import make_classification
 
 # --- Configuration ---
 SERVER_ADDR = os.environ.get("SERVER_ADDRESS", "http://server:8080")
@@ -39,6 +42,12 @@ REPORT_DELTA = float(os.environ.get("REPORT_DELTA", DP_DELTA))        # delta us
 RDP_ORDERS = [1.25,1.5,2,2.5,3,5,10,20,50,100]                       # RDP orders to search
 rounds_done = 0
 
+# --- ML State ---
+X_train = None
+y_train = None
+X_test = None
+y_test = None
+NUM_FEATURES = 30 # V1-V28 + Amount + Bias (Time is dropped)
 
 # --- Background P2P Server ---
 app = Flask(__name__)
@@ -52,7 +61,7 @@ def trigger_keygen():
     
     # 1. Generate Keys
     print("Generating Paillier Keypair...")
-    public_key, private_key = phe.paillier.generate_paillier_keypair()
+    public_key, private_key = phe.paillier.generate_paillier_keypair(n_length=1024)
     keys_received_event.set()
     
     # 2. Share Private Key with Peers (P2P)
@@ -67,7 +76,7 @@ def trigger_keygen():
         try:
             print(f"Sending keys to peer: {peer}")
             # Assuming peer ID is hostname
-            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=5)
+            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=300)
         except Exception as e:
             print(f"Failed to send keys to {peer}: {e}")
             
@@ -102,7 +111,7 @@ def share_keys():
     for peer in peers:
         try:
             print(f"Sending keys to peer: {peer}")
-            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=5)
+            requests.post(f"http://{peer}:{CLIENT_PORT}/receive_keys", json=key_data, timeout=300)
         except Exception as e:
             print(f"Failed to send keys to {peer}: {e}")
             
@@ -122,11 +131,97 @@ def receive_keys():
     private_key = phe.paillier.PaillierPrivateKey(public_key, p, q)
     
     keys_received_event.set()
-    
     return jsonify({"status": "keys_received"})
 
 def run_background_server():
     app.run(host="0.0.0.0", port=CLIENT_PORT, debug=False, use_reloader=False)
+
+def sigmoid(z):
+    return 1 / (1 + np.exp(-z))
+
+def train_model(weights, X, y, epochs=1, learning_rate=0.1):
+    m = len(y)
+    weights = np.array(weights)
+    
+    for _ in range(epochs):
+        z = np.dot(X, weights)
+        h = sigmoid(z)
+        gradient = np.dot(X.T, (h - y)) / m
+        weights -= learning_rate * gradient
+        
+    return weights.tolist()
+
+def load_data():
+    global X_train, y_train, X_test, y_test, NUM_FEATURES
+    
+    dataset_name = os.environ.get("DATASET_NAME", "creditcard")
+    print(f"Loading dataset: {dataset_name}")
+    
+    try:
+        if dataset_name == "synthetic":
+            # Generate synthetic balanced data
+            print("Generating synthetic data...")
+            X, y = make_classification(
+                n_samples=10000, 
+                n_features=30, 
+                n_informative=20, 
+                n_redundant=5, 
+                n_classes=2, 
+                random_state=42
+            )
+            # Scale the features
+            X = StandardScaler().fit_transform(X)
+            
+            # Add bias term
+            X = np.c_[np.ones((X.shape[0], 1)), X]
+            
+        elif dataset_name == "creditcard":
+            print("Reading creditcard.csv...")
+            df = pd.read_csv("creditcard.csv")
+            
+            # Preprocessing
+            # 1. Drop Time
+            df = df.drop(['Time'], axis=1)
+            
+            # 2. Scale Amount
+            df['Amount'] = StandardScaler().fit_transform(df['Amount'].values.reshape(-1, 1))
+            
+            # 3. Split Features and Target
+            X = df.drop(['Class'], axis=1).values
+            y = df['Class'].values
+            
+            # 4. Add Bias Term
+            X = np.c_[np.ones((X.shape[0], 1)), X]
+            
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}")
+        
+        # 5. Split for this client (Simulate FL by taking a random chunk)
+        # We will take a random 5000 sample of the dataset for this client.
+        # Ensure we don't sample more than available
+        n_samples = min(5000, len(X))
+        indices = np.random.choice(len(X), n_samples, replace=False)
+        X_subset = X[indices]
+        y_subset = y[indices]
+        
+        # Split into Train (80%) and Test (20%)
+        split_idx = int(0.8 * len(X_subset))
+        X_train = X_subset[:split_idx]
+        y_train = y_subset[:split_idx]
+        X_test = X_subset[split_idx:]
+        y_test = y_subset[split_idx:]
+        
+        NUM_FEATURES = X_train.shape[1]
+        print(f"Data loaded. Train: {X_train.shape}, Test: {X_test.shape}. Features: {NUM_FEATURES}")
+        
+    except Exception as e:
+        print(f"Failed to load dataset: {e}")
+        # Fallback to dummy data
+        X_train = np.random.randn(100, 31)
+        y_train = np.random.randint(0, 2, 100)
+        X_test = np.random.randn(20, 31)
+        y_test = np.random.randint(0, 2, 20)
+        NUM_FEATURES = 31
 
 # --- Main Client Logic ---
 print(f"Client {CLIENT_ID} starting...")
@@ -194,6 +289,8 @@ if DP_ENABLED:
         print("Error computing sigma:", e)
         per_round_sigma = None
 
+# Load Data
+load_data()
 
 # 1. Register
 while True:
@@ -212,8 +309,63 @@ last_processed_round = 0
 while True:
     try:
         # Poll Server
-        response = requests.get(f"{SERVER_ADDR}/get_model", timeout=5)
+        response = requests.get(f"{SERVER_ADDR}/get_model", timeout=300)
         data = response.json()
+        
+        if data.get("complete"):
+            print("\n=== TRAINING COMPLETE. STARTING EVALUATION ===")
+            
+            # Decrypt Final Model
+            encrypted_weights_serialized = data["weights"]
+            total_samples = data.get("total_samples", 1)
+            
+            final_weights = []
+            if encrypted_weights_serialized:
+                print("Decrypting final global model...")
+                for (ctxt, exp) in encrypted_weights_serialized:
+                    enc_num = phe.paillier.EncryptedNumber(public_key, int(ctxt), int(exp))
+                    final_weights.append(private_key.decrypt(enc_num) / total_samples)
+            else:
+                final_weights = [0.0] * NUM_FEATURES
+
+            # Evaluate on Test Set
+            print(f"Evaluating on {len(X_test)} test samples...")
+            z = np.dot(X_test, final_weights)
+            predictions = sigmoid(z)
+            y_pred = (predictions > 0.5).astype(int)
+            
+            acc = accuracy_score(y_test, y_pred)
+            prec = precision_score(y_test, y_pred, zero_division=0)
+            rec = recall_score(y_test, y_pred, zero_division=0)
+            f1 = f1_score(y_test, y_pred, zero_division=0)
+            cm = confusion_matrix(y_test, y_pred)
+            
+            print("\n" + "="*40)
+            print(f"CLIENT {CLIENT_ID} FINAL RESULTS")
+            print("="*40)
+            print(f"Accuracy:  {acc:.4f}")
+            print(f"Precision: {prec:.4f}")
+            print(f"Recall:    {rec:.4f}")
+            print(f"F1 Score:  {f1:.4f}")
+            print("-" * 20)
+            print(f"Confusion Matrix:\n{cm}")
+            print("="*40 + "\n")
+            
+            # Save Model
+            model_data = {
+                "weights": final_weights,
+                "metrics": {
+                    "accuracy": acc,
+                    "precision": prec,
+                    "recall": rec,
+                    "f1": f1
+                }
+            }
+            with open("final_model.json", "w") as f:
+                json.dump(model_data, f)
+            print("Final model saved to final_model.json")
+            
+            break
         
         server_round = data["round"]
         selected_clients = data["selected_clients"]
@@ -250,17 +402,25 @@ while True:
                         plaintext_weights.append(decrypted_sum / total_samples)
                 else:
                     # Fallback if empty (shouldn't happen if server inits correctly)
-                    plaintext_weights = [0.0, 0.0, 0.0]
+                    plaintext_weights = [0.0] * NUM_FEATURES
                 
-                print(f"Decrypted Global Model: {plaintext_weights}")
+                print(f"Decrypted Global Model (First 5): {plaintext_weights[:5]}")
 
-                # 2. Simulate Training
-                time.sleep(random.uniform(0.5, 2.0))
-                num_samples = random.randint(10, 100)
-                # Simple training simulation: add random noise
-                local_weights = [w + random.uniform(0.1, 0.5) for w in plaintext_weights]
+                # 2. Real Training
+                print("Training on local data...")
+                
+                # Ensure weights length matches features
+                if len(plaintext_weights) != NUM_FEATURES:
+                    print(f"WARNING: Weight shape mismatch. Server: {len(plaintext_weights)}, Local: {NUM_FEATURES}")
+                    if len(plaintext_weights) < NUM_FEATURES:
+                        plaintext_weights.extend([0.0] * (NUM_FEATURES - len(plaintext_weights)))
+                    else:
+                        plaintext_weights = plaintext_weights[:NUM_FEATURES]
 
-                print(f"Trained Local Model: {local_weights}")
+
+                local_weights = train_model(plaintext_weights, X_train, y_train, epochs=10, learning_rate=1.0)
+                
+                print(f"Trained Local Model (First 5): {local_weights[:5]}")
 
                 # Differential Privacy: compute update = local - global, clip, add Gaussian noise
                 # convert lists to numpy arrays for vectorized ops
@@ -296,10 +456,10 @@ while True:
                 payload = {
                     "client_id": CLIENT_ID,
                     "weights": encrypted_local_weights,
-                    "num_samples": num_samples
+                    "num_samples": len(X_train)
                 }
-                requests.post(f"{SERVER_ADDR}/send_update", json=payload)
-                print(f"Update sent. Samples: {num_samples}")
+                requests.post(f"{SERVER_ADDR}/send_update", json=payload, timeout=300)
+                print(f"Update sent. Samples: {len(X_train)}")
                 
                 # --- after sending the encrypted update ---
                 rounds_done += 1
