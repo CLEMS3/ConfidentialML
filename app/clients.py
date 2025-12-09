@@ -52,7 +52,7 @@ def trigger_keygen():
     
     # step 1: generating the keys
     print("Generating Paillier Keypair...")
-    public_key, private_key = phe.paillier.generate_paillier_keypair(n_length=1024)
+    public_key, private_key = phe.paillier.generate_paillier_keypair(n_length=2048)
     keys_received_event.set()
     
     # step 2: sharing the private key with peers
