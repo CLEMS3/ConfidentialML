@@ -16,8 +16,6 @@ Multiple clients collaboratively train a shared model under a strict **honest-bu
 - The server aggregates updates *without ever decrypting them*.
 - **Differential Privacy** (Gaussian noise + L2 clipping) is applied client-side to further protect individual data contributions.
 
-> **Inspired by:** Madi et al., *"A Secure Federated Learning Framework using Homomorphic Encryption and Verifiable Computing"*, RDAAPS 2021.
-
 ---
 
 ## 🎯 Problem Statement
