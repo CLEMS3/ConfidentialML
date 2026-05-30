@@ -141,7 +141,7 @@ Key environment variables can be adjusted in `docker-compose.yaml`:
 
 ## 📊 Results
 
-Validated end-to-end on a credit card fraud detection dataset. Performance stabilized at the following optimal hyperparameters:
+Validated end-to-end on a synthetic binary classification dataset (generated with `sklearn.make_classification`). Performance stabilized at the following optimal hyperparameters:
 
 | Parameter | Optimal Value |
 |---|---|

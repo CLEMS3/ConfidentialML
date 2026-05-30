@@ -199,12 +199,6 @@ def load_data():
         y_test = np.random.randint(0, 2, 20)
         NUM_FEATURES = 31
 
-# Main Client Logic
-print(f"Client {CLIENT_ID} starting...")
-
-server_thread = threading.Thread(target=run_background_server, daemon=True)
-server_thread.start()
-
 def gaussian_sigma_for_eps_delta(C: float, eps: float, delta: float) -> float:
     """
     Standard sufficient sigma for (eps, delta)-DP with Gaussian mechanism for L2 sensitivity C.
@@ -250,180 +244,187 @@ def compose_rdp_and_get_eps(sigma: float, C: float, orders, delta, rounds):
     return get_eps_from_rdp(orders, total_rdp, delta)
 
 
-per_round_sigma = None
-if DP_ENABLED:
-    try:
-        per_round_sigma = gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
-        print(f"Per-round noise sigma computed: {per_round_sigma:.6f}")
-    except Exception as e:
-        print("Error computing sigma:", e)
-        per_round_sigma = None
+if __name__ == "__main__":
+    # Main Client Logic
+    print(f"Client {CLIENT_ID} starting...")
 
-load_data()
+    server_thread = threading.Thread(target=run_background_server, daemon=True)
+    server_thread.start()
 
-while True:
-    try:
-        resp = requests.post(f"{SERVER_ADDR}/register", json={"client_id": CLIENT_ID})
-        if resp.status_code == 200:
-            print("Successfully registered with server.")
-            break
-    except:
-        print("Waiting for server to come online...")
-        time.sleep(3)
+    per_round_sigma = None
+    if DP_ENABLED:
+        try:
+            per_round_sigma = gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
+            print(f"Per-round noise sigma computed: {per_round_sigma:.6f}")
+        except Exception as e:
+            print("Error computing sigma:", e)
+            per_round_sigma = None
 
-last_processed_round = 0
+    load_data()
 
-while True:
-    try:
-        response = requests.get(f"{SERVER_ADDR}/get_model", timeout=300)
-        data = response.json()
-        
-        if data.get("complete"):
-            print("\n=== TRAINING COMPLETE. STARTING EVALUATION ===")
-            
-            encrypted_weights_serialized = data["weights"]
-            total_samples = data.get("total_samples", 1)
-            
-            final_weights = []
-            if encrypted_weights_serialized:
-                print("Decrypting final global model...")
-                for (ctxt, exp) in encrypted_weights_serialized:
-                    enc_num = phe.paillier.EncryptedNumber(public_key, int(ctxt), int(exp))
-                    final_weights.append(private_key.decrypt(enc_num) / total_samples)
-            else:
-                final_weights = [0.0] * NUM_FEATURES
+    while True:
+        try:
+            resp = requests.post(f"{SERVER_ADDR}/register", json={"client_id": CLIENT_ID})
+            if resp.status_code == 200:
+                print("Successfully registered with server.")
+                break
+        except:
+            print("Waiting for server to come online...")
+            time.sleep(3)
 
-            print(f"Evaluating on {len(X_test)} test samples...")
-            z = np.dot(X_test, final_weights)
-            predictions = sigmoid(z)
-            y_pred = (predictions > 0.5).astype(int)
-            
-            acc = accuracy_score(y_test, y_pred)
-            prec = precision_score(y_test, y_pred, zero_division=0)
-            rec = recall_score(y_test, y_pred, zero_division=0)
-            f1 = f1_score(y_test, y_pred, zero_division=0)
-            cm = confusion_matrix(y_test, y_pred)
-            
-            print("\n" + "="*40)
-            print(f"CLIENT {CLIENT_ID} FINAL RESULTS")
-            print("="*40)
-            print(f"Accuracy:  {acc:.4f}")
-            print(f"Precision: {prec:.4f}")
-            print(f"Recall:    {rec:.4f}")
-            print(f"F1 Score:  {f1:.4f}")
-            print("-" * 20)
-            print(f"Confusion Matrix:\n{cm}")
-            print("="*40 + "\n")
-            
-            model_data = {
-                "weights": final_weights,
-                "metrics": {
-                    "accuracy": acc,
-                    "precision": prec,
-                    "recall": rec,
-                    "f1": f1
-                }
-            }
-            with open("final_model.json", "w") as f:
-                json.dump(model_data, f)
-            print("Final model saved to final_model.json")
-            
-            break
-        
-        server_round = data["round"]
-        selected_clients = data["selected_clients"]
-        
-        if not keys_received_event.is_set():
-            if server_round > 0:
-                print("Waiting for keys...")
-            time.sleep(2)
-            continue
+    last_processed_round = 0
 
-        if server_round > last_processed_round:
-            if CLIENT_ID in selected_clients:
-                print(f"\n[ROUND {server_round}] I was selected! Training...")
+    while True:
+        try:
+            response = requests.get(f"{SERVER_ADDR}/get_model", timeout=300)
+            data = response.json()
+
+            if data.get("complete"):
+                print("\n=== TRAINING COMPLETE. STARTING EVALUATION ===")
+
                 encrypted_weights_serialized = data["weights"]
                 total_samples = data.get("total_samples", 1)
-                
-                plaintext_weights = []
+
+                final_weights = []
                 if encrypted_weights_serialized:
+                    print("Decrypting final global model...")
                     for (ctxt, exp) in encrypted_weights_serialized:
                         enc_num = phe.paillier.EncryptedNumber(public_key, int(ctxt), int(exp))
-                        decrypted_sum = private_key.decrypt(enc_num)
-                        plaintext_weights.append(decrypted_sum / total_samples)
+                        final_weights.append(private_key.decrypt(enc_num) / total_samples)
                 else:
-                    plaintext_weights = [0.0] * NUM_FEATURES
-                
-                print(f"Decrypted Global Model (First 5): {plaintext_weights[:5]}")
+                    final_weights = [0.0] * NUM_FEATURES
 
-                print("Training on local data...")
-                
-                if len(plaintext_weights) != NUM_FEATURES:
-                    print(f"WARNING: Weight shape mismatch. Server: {len(plaintext_weights)}, Local: {NUM_FEATURES}")
-                    if len(plaintext_weights) < NUM_FEATURES:
-                        plaintext_weights.extend([0.0] * (NUM_FEATURES - len(plaintext_weights)))
-                    else:
-                        plaintext_weights = plaintext_weights[:NUM_FEATURES]
+                print(f"Evaluating on {len(X_test)} test samples...")
+                z = np.dot(X_test, final_weights)
+                predictions = sigmoid(z)
+                y_pred = (predictions > 0.5).astype(int)
 
+                acc = accuracy_score(y_test, y_pred)
+                prec = precision_score(y_test, y_pred, zero_division=0)
+                rec = recall_score(y_test, y_pred, zero_division=0)
+                f1 = f1_score(y_test, y_pred, zero_division=0)
+                cm = confusion_matrix(y_test, y_pred)
 
-                local_weights = train_model(plaintext_weights, X_train, y_train, epochs=10, learning_rate=1.0)
-                
-                print(f"Trained Local Model (First 5): {local_weights[:5]}")
+                print("\n" + "="*40)
+                print(f"CLIENT {CLIENT_ID} FINAL RESULTS")
+                print("="*40)
+                print(f"Accuracy:  {acc:.4f}")
+                print(f"Precision: {prec:.4f}")
+                print(f"Recall:    {rec:.4f}")
+                print(f"F1 Score:  {f1:.4f}")
+                print("-" * 20)
+                print(f"Confusion Matrix:\n{cm}")
+                print("="*40 + "\n")
 
-                plaintext_weights_np = np.array(plaintext_weights, dtype=np.float64)
-                local_weights_np = np.array(local_weights, dtype=np.float64)
-
-                update = local_weights_np - plaintext_weights_np
-
-                if DP_ENABLED:
-                    clipped_update, orig_norm, factor = l2_clip_vector(update, CLIP_NORM)
-                    sigma = per_round_sigma if per_round_sigma is not None else gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
-                    noised_update = add_gaussian_noise_vec(clipped_update, sigma, _rng)
-                    noised_local_np = plaintext_weights_np + noised_update
-                    noised_local = noised_local_np.tolist()
-                    print(f"DP: orig_norm={orig_norm:.4f}, clipped_factor={factor:.6f}, per-round_sigma={sigma:.6f}")
-                else:
-                    noised_local = local_weights
-
-
-
-                encrypted_local_weights = []
-                for w in noised_local:
-                    enc_w = public_key.encrypt(w)
-                    encrypted_local_weights.append((str(enc_w.ciphertext()), enc_w.exponent))
-
-                payload = {
-                    "client_id": CLIENT_ID,
-                    "weights": encrypted_local_weights,
-                    "num_samples": len(X_train)
+                model_data = {
+                    "weights": final_weights,
+                    "metrics": {
+                        "accuracy": acc,
+                        "precision": prec,
+                        "recall": rec,
+                        "f1": f1
+                    }
                 }
-                requests.post(f"{SERVER_ADDR}/send_update", json=payload, timeout=300)
-                print(f"Update sent. Samples: {len(X_train)}")
-                
-                rounds_done += 1
+                with open("final_model.json", "w") as f:
+                    json.dump(model_data, f)
+                print("Final model saved to final_model.json")
 
-                try:
-                    composed_eps = compose_rdp_and_get_eps(per_round_sigma, CLIP_NORM, RDP_ORDERS, REPORT_DELTA, rounds_done)
-                    print(f"Rounds so far: {rounds_done}. Composed epsilon (delta={REPORT_DELTA}): eps ≈ {composed_eps:.4f}")
-                except Exception as e:
-                    print("RDP accounting error:", e)
+                break
 
-                if composed_eps > TARGET_TOTAL_EPS:
-                    print(f"Privacy budget exceeded: composed_eps {composed_eps:.4f} > TARGET_TOTAL_EPS {TARGET_TOTAL_EPS}")
-                    import sys
-                    sys.exit(0)
+            server_round = data["round"]
+            selected_clients = data["selected_clients"]
+
+            if not keys_received_event.is_set():
+                if server_round > 0:
+                    print("Waiting for keys...")
+                time.sleep(2)
+                continue
+
+            if server_round > last_processed_round:
+                if CLIENT_ID in selected_clients:
+                    print(f"\n[ROUND {server_round}] I was selected! Training...")
+                    encrypted_weights_serialized = data["weights"]
+                    total_samples = data.get("total_samples", 1)
+
+                    plaintext_weights = []
+                    if encrypted_weights_serialized:
+                        for (ctxt, exp) in encrypted_weights_serialized:
+                            enc_num = phe.paillier.EncryptedNumber(public_key, int(ctxt), int(exp))
+                            decrypted_sum = private_key.decrypt(enc_num)
+                            plaintext_weights.append(decrypted_sum / total_samples)
+                    else:
+                        plaintext_weights = [0.0] * NUM_FEATURES
+
+                    print(f"Decrypted Global Model (First 5): {plaintext_weights[:5]}")
+
+                    print("Training on local data...")
+
+                    if len(plaintext_weights) != NUM_FEATURES:
+                        print(f"WARNING: Weight shape mismatch. Server: {len(plaintext_weights)}, Local: {NUM_FEATURES}")
+                        if len(plaintext_weights) < NUM_FEATURES:
+                            plaintext_weights.extend([0.0] * (NUM_FEATURES - len(plaintext_weights)))
+                        else:
+                            plaintext_weights = plaintext_weights[:NUM_FEATURES]
 
 
-                last_processed_round = server_round
-            else:
-                print(f"\n[ROUND {server_round}] I was NOT selected. Skipping.")
-                last_processed_round = server_round
-        
-        elif server_round == 0:
-            pass
-            
-    except Exception as e:
-        print(f"Error: {e}")
-        time.sleep(5)
-        
-    time.sleep(2)
+                    local_weights = train_model(plaintext_weights, X_train, y_train, epochs=10, learning_rate=1.0)
+
+                    print(f"Trained Local Model (First 5): {local_weights[:5]}")
+
+                    plaintext_weights_np = np.array(plaintext_weights, dtype=np.float64)
+                    local_weights_np = np.array(local_weights, dtype=np.float64)
+
+                    update = local_weights_np - plaintext_weights_np
+
+                    if DP_ENABLED:
+                        clipped_update, orig_norm, factor = l2_clip_vector(update, CLIP_NORM)
+                        sigma = per_round_sigma if per_round_sigma is not None else gaussian_sigma_for_eps_delta(CLIP_NORM, DP_EPS, DP_DELTA) * NOISE_MULTIPLIER
+                        noised_update = add_gaussian_noise_vec(clipped_update, sigma, _rng)
+                        noised_local_np = plaintext_weights_np + noised_update
+                        noised_local = noised_local_np.tolist()
+                        print(f"DP: orig_norm={orig_norm:.4f}, clipped_factor={factor:.6f}, per-round_sigma={sigma:.6f}")
+                    else:
+                        noised_local = local_weights
+
+
+
+                    encrypted_local_weights = []
+                    for w in noised_local:
+                        enc_w = public_key.encrypt(w)
+                        encrypted_local_weights.append((str(enc_w.ciphertext()), enc_w.exponent))
+
+                    payload = {
+                        "client_id": CLIENT_ID,
+                        "weights": encrypted_local_weights,
+                        "num_samples": len(X_train)
+                    }
+                    requests.post(f"{SERVER_ADDR}/send_update", json=payload, timeout=300)
+                    print(f"Update sent. Samples: {len(X_train)}")
+
+                    rounds_done += 1
+
+                    try:
+                        composed_eps = compose_rdp_and_get_eps(per_round_sigma, CLIP_NORM, RDP_ORDERS, REPORT_DELTA, rounds_done)
+                        print(f"Rounds so far: {rounds_done}. Composed epsilon (delta={REPORT_DELTA}): eps ≈ {composed_eps:.4f}")
+                    except Exception as e:
+                        print("RDP accounting error:", e)
+
+                    if composed_eps > TARGET_TOTAL_EPS:
+                        print(f"Privacy budget exceeded: composed_eps {composed_eps:.4f} > TARGET_TOTAL_EPS {TARGET_TOTAL_EPS}")
+                        import sys
+                        sys.exit(0)
+
+
+                    last_processed_round = server_round
+                else:
+                    print(f"\n[ROUND {server_round}] I was NOT selected. Skipping.")
+                    last_processed_round = server_round
+
+            elif server_round == 0:
+                pass
+
+        except Exception as e:
+            print(f"Error: {e}")
+            time.sleep(5)
+
+        time.sleep(2)

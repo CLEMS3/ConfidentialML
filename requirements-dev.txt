@@ -1,0 +1,4 @@
+# Development / test dependencies.
+# Runtime deps live in app/requirements.txt.
+-r app/requirements.txt
+pytest
